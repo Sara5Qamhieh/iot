@@ -237,7 +237,7 @@ def main():
 
                 # If you want recyclable to go RIGHT instead, flip these:
                 # cmd = b"R" if decision == "L" else b"L"
-                cmd = b"L" if decision == "L" else b"R"
+                cmd = b"R" if decision == "L" else b"L"
 
                 ok = send_with_ack(ser, cmd)
                 print(f">>> SENT {cmd.decode()} {'OK' if ok else 'FAILED'}")

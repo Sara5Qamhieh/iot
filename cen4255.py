@@ -4,43 +4,31 @@ import cv2
 from ultralytics import YOLO
 from picamera2 import Picamera2
 
-# =========================
-# SERIAL (Pi <-> Arduino)
-# =========================
-SERIAL_PORT = "/dev/ttyUSB0"   # change if yours is /dev/ttyACM0
+# ---------------- Serial ----------------
+SERIAL_PORT = "/dev/ttyUSB0"   # or /dev/ttyACM0
 BAUD_RATE = 115200
 
-# =========================
-# YOLO
-# =========================
-MODEL_PATH = "yolo11n.pt"      # or "yolov8n.pt"
+# ---------------- YOLO ----------------
+MODEL_PATH = "yolo11n.pt"      # or yolov8n.pt
 IMG_SIZE = 640
-CONF_THRES = 0.35              # lower helps detection
-STABLE_FRAMES_REQUIRED = 3     # same decision N frames in a row to trigger
+CONF_THRES = 0.30              # a bit lower helps
+STABLE_FRAMES_REQUIRED = 2     # make it easier to trigger on Pi
+COOLDOWN_SECONDS = 2.0
 
-# Only these classes will be considered "recyclable"
-RECYCLABLE_CLASSES = {
-    "bottle", "cup", "wine glass", "fork", "knife", "spoon", "bowl"
-}
-
-# We will ignore these classes for triggering (hand/person problems)
+RECYCLABLE_CLASSES = {"bottle", "cup", "wine glass", "fork", "knife", "spoon", "bowl"}
 IGNORE_CLASSES = {"person"}
 
-# =========================
-# CAMERA / ROI (drop zone)
-# =========================
-FRAME_W, FRAME_H = 1280, 960   # 4:3 reduces cropping on Pi Cam v2
+# ---------------- Camera / ROI ----------------
+FRAME_W, FRAME_H = 1280, 960   # 4:3
+# Start BIG to avoid “partial bottle” problems. Tighten later.
+ROI_X1, ROI_Y1 = 0.15, 0.20
+ROI_X2, ROI_Y2 = 0.85, 0.95
 
-# ROI as fractions of image (tune!)
-# Default: center-lower region. This helps avoid detecting your hand in upper area.
-ROI_X1, ROI_Y1 = 0.30, 0.35
-ROI_X2, ROI_Y2 = 0.70, 0.90
+# If at least this fraction of bbox overlaps ROI, we accept it
+ROI_OVERLAP_MIN = 0.15
 
-# =========================
-# TRIGGER / LATCH behavior
-# =========================
-COOLDOWN_SECONDS = 2.0          # minimum time between triggers
-MISSING_FRAMES_TO_RESET = 10    # object must disappear for N frames before next trigger
+# ---------------- One-time trigger latch ----------------
+MISSING_FRAMES_TO_RESET = 10
 
 
 def parse_fill_data(line):
@@ -57,24 +45,43 @@ def parse_fill_data(line):
         return None
 
 
-def point_in_roi(cx, cy, w, h):
-    x1 = int(ROI_X1 * w)
-    y1 = int(ROI_Y1 * h)
-    x2 = int(ROI_X2 * w)
-    y2 = int(ROI_Y2 * h)
-    return (x1 <= cx <= x2) and (y1 <= cy <= y2)
+def rect_intersection_area(a, b):
+    # a,b = (x1,y1,x2,y2)
+    x1 = max(a[0], b[0])
+    y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2])
+    y2 = min(a[3], b[3])
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    return float((x2 - x1) * (y2 - y1))
 
 
-def choose_best_object_in_roi(result, names, w, h):
+def rect_area(r):
+    return float(max(0, r[2] - r[0]) * max(0, r[3] - r[1]))
+
+
+def bbox_overlaps_roi(bbox, roi):
+    inter = rect_intersection_area(bbox, roi)
+    a = rect_area(bbox)
+    if a <= 0:
+        return False
+    return (inter / a) >= ROI_OVERLAP_MIN
+
+
+def pick_decision(result, names, roi):
     """
-    Returns (class_name, confidence) for the best detection whose center is in ROI,
-    ignoring IGNORE_CLASSES.
+    Returns: (decision 'L'/'R', label, conf) or (None,None,0)
+    Logic:
+      - ignore 'person'
+      - consider only boxes that overlap ROI enough
+      - if any recyclable class exists -> choose best recyclable
+      - else choose best other object
     """
     if result.boxes is None or len(result.boxes) == 0:
-        return None, 0.0
+        return None, None, 0.0
 
-    best_name = None
-    best_conf = 0.0
+    candidates_recy = []
+    candidates_other = []
 
     for b in result.boxes:
         conf = float(b.conf[0])
@@ -83,65 +90,62 @@ def choose_best_object_in_roi(result, names, w, h):
 
         if name in IGNORE_CLASSES:
             continue
-
-        # box coords
-        x1, y1, x2, y2 = b.xyxy[0].tolist()
-        cx = int((x1 + x2) / 2)
-        cy = int((y1 + y2) / 2)
-
-        if not point_in_roi(cx, cy, w, h):
+        if conf < CONF_THRES:
             continue
 
-        if conf > best_conf:
-            best_conf = conf
-            best_name = name
+        x1, y1, x2, y2 = b.xyxy[0].tolist()
+        bbox = (x1, y1, x2, y2)
 
-    return best_name, best_conf
+        if not bbox_overlaps_roi(bbox, roi):
+            continue
 
+        if name in RECYCLABLE_CLASSES:
+            candidates_recy.append((conf, name))
+        else:
+            candidates_other.append((conf, name))
 
-def decide_direction_from_name(name: str) -> str:
-    # 'L' recyclable, 'R' non-recyclable
-    return "L" if name in RECYCLABLE_CLASSES else "R"
+    if candidates_recy:
+        conf, name = max(candidates_recy, key=lambda t: t[0])
+        return "L", name, conf
+
+    if candidates_other:
+        conf, name = max(candidates_other, key=lambda t: t[0])
+        return "R", name, conf
+
+    return None, None, 0.0
 
 
 def main():
-    # ---- Serial ----
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
     time.sleep(2)
     print(f"Connected to Arduino on {SERIAL_PORT} @ {BAUD_RATE}")
 
-    # ---- YOLO ----
     model = YOLO(MODEL_PATH)
     names = model.names
     print(f"Loaded model: {MODEL_PATH}")
 
-    # ---- Camera ----
     picam2 = Picamera2()
     cfg = picam2.create_video_configuration(main={"size": (FRAME_W, FRAME_H), "format": "RGB888"})
     picam2.configure(cfg)
     picam2.start()
     time.sleep(0.2)
 
-    # Remove zoom/crop
+    # remove zoom/crop
     full_res = picam2.camera_properties["PixelArraySize"]
     picam2.set_controls({"ScalerCrop": (0, 0, full_res[0], full_res[1])})
 
-    print("Camera started. Waiting for objects in ROI...")
-
-    # ---- One-time trigger state ----
-    last_sent_time = 0.0
-    object_latched = False
-    missing_frames = 0
-    last_decision = None
-    stable_count = 0
+    last_sent = 0.0
+    latched = False
+    missing = 0
+    last_dec = None
+    stable = 0
 
     while True:
-        # 1) Read Arduino status (non-blocking)
+        # Read Arduino
         while ser.in_waiting > 0:
             line = ser.readline().decode(errors="ignore").strip()
             if not line:
                 continue
-
             if "BIN1_CM" in line:
                 data = parse_fill_data(line)
                 if data:
@@ -149,66 +153,52 @@ def main():
                     print(f"\n--- BIN STATUS ---")
                     print(f"Recyclable Bin:     {b1_cm:.1f} cm | FULL: {b1_full}")
                     print(f"Non-Recyclable Bin: {b2_cm:.1f} cm | FULL: {b2_full}")
-            # ignore debug lines to reduce noise (optional)
-            # else:
-            #     print("[ARDUINO]", line)
+            else:
+                print("[ARDUINO]", line)
 
-        # 2) Grab frame
         frame = picam2.capture_array()  # RGB
-        h, w = frame.shape[0], frame.shape[1]
+        h, w = frame.shape[:2]
 
-        # 3) Draw ROI for debugging
-        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        # ROI rect (pixel coords)
         rx1, ry1 = int(ROI_X1 * w), int(ROI_Y1 * h)
         rx2, ry2 = int(ROI_X2 * w), int(ROI_Y2 * h)
-        cv2.rectangle(bgr, (rx1, ry1), (rx2, ry2), (0, 255, 0), 2)
-        cv2.putText(bgr, "DROP ZONE", (rx1, ry1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        roi = (rx1, ry1, rx2, ry2)
 
-        cv2.imshow("Waste Sorting (q=quit) - Put item in GREEN box", bgr)
+        # show preview + ROI
+        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        cv2.rectangle(bgr, (rx1, ry1), (rx2, ry2), (0, 255, 0), 2)
+        cv2.imshow("Sorting (q=quit) - put item in green zone", bgr)
         if (cv2.waitKey(1) & 0xFF) == ord("q"):
             break
 
-        # 4) Run YOLO
+        # YOLO
         results = model.predict(frame, imgsz=IMG_SIZE, verbose=False)
-        name, conf = choose_best_object_in_roi(results[0], names, w, h)
+        decision, label, conf = pick_decision(results[0], names, roi)
 
-        # 5) Latch logic: object must disappear before next trigger
-        if name is None or conf < CONF_THRES:
-            missing_frames += 1
-            stable_count = 0
-            last_decision = None
-
-            if missing_frames >= MISSING_FRAMES_TO_RESET:
-                object_latched = False
+        if decision is None:
+            missing += 1
+            stable = 0
+            last_dec = None
+            if missing >= MISSING_FRAMES_TO_RESET:
+                latched = False
             time.sleep(0.01)
             continue
 
-        # something detected in ROI
-        missing_frames = 0
-        decision = decide_direction_from_name(name)
+        missing = 0
+        print(f"YOLO: {label} conf={conf:.2f} => {decision}")
 
-        # stable decision requirement
-        if decision == last_decision:
-            stable_count += 1
+        if decision == last_dec:
+            stable += 1
         else:
-            last_decision = decision
-            stable_count = 1
-
-        print(f"YOLO ROI sees: {name} conf={conf:.2f} -> decision {decision} (stable {stable_count}/{STABLE_FRAMES_REQUIRED})")
+            last_dec = decision
+            stable = 1
 
         now = time.time()
-
-        # Trigger only ONCE per object appearance
-        if (not object_latched) and (stable_count >= STABLE_FRAMES_REQUIRED) and ((now - last_sent_time) >= COOLDOWN_SECONDS):
-            object_latched = True
-            last_sent_time = now
-
-            if decision == "L":
-                print(">>> SEND L (Recyclable)")
-                ser.write(b"L")
-            else:
-                print(">>> SEND R (Non-Recyclable)")
-                ser.write(b"R")
+        if (not latched) and stable >= STABLE_FRAMES_REQUIRED and (now - last_sent) >= COOLDOWN_SECONDS:
+            latched = True
+            last_sent = now
+            ser.write(b"L" if decision == "L" else b"R")
+            print(f">>> SENT {decision} ({'Recyclable' if decision=='L' else 'Non-recyclable'})")
 
         time.sleep(0.01)
 
